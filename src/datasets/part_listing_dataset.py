@@ -12,9 +12,16 @@ import logging
 import sys
 
 import numpy as np
-import torch
-import torchvision
-from torch.utils.data import Dataset
+from typing import List, Dict, Any, Optional
+try:
+    import torch
+    import torchvision
+    from torch.utils.data import Dataset
+except ImportError:
+    # Use a dummy Dataset class if torch is missing
+    class Dataset: pass
+    torch = None
+    torchvision = None
 
 from PIL import Image
 
@@ -79,49 +86,16 @@ SYNSET_TO_SUPERCATEGORY = {
 class PartImageNetDataset(Dataset):
     """
     PartImageNet dataset wrapper that returns images AND part labels.
-
-    Expected directory structure:
-        root_path/
-        ├── train/
-        │   ├── n01440764/
-        │   │   ├── n01440764_10026.JPEG
-        │   │   └── ...
-        │   └── ...
-        ├── val/
-        │   └── ...
-        └── annotations/
-            ├── train.json
-            └── val.json
-
-    The annotation JSON follows COCO-style format with part segmentation:
-    {
-        "images": [...],
-        "annotations": [
-            {
-                "image_id": ...,
-                "category_id": ...,
-                "parts": [
-                    {"part_name": "head", "segmentation": [...]},
-                    {"part_name": "body", "segmentation": [...]},
-                    ...
-                ]
-            }
-        ],
-        "categories": [
-            {"id": ..., "name": "...", "supercategory": "Quadruped"},
-            ...
-        ]
-    }
-
-    Args:
-        root_path: path to PartImageNet root directory
-        annotation_file: path to annotation JSON file
-        image_folder: relative path to image directory (e.g., 'train/')
-        transform: image transforms
-        supercategory_map: mapping from category to supercategory
-        train: whether this is training data
-        max_parts: maximum number of part labels to return
     """
+    annotations: List[Dict[str, Any]] = []
+    has_annotations: bool = False
+    image_dataset: Any = None
+    default_parts: List[str] = []
+    max_parts: int = 12
+    transform: Any = None
+    image_folder: str = ""
+    root_path: str = ""
+
     def __init__(
         self,
         root_path,
@@ -136,6 +110,10 @@ class PartImageNetDataset(Dataset):
         self.transform = transform
         self.train = train
         self.max_parts = max_parts
+        self.annotations = []
+        self.has_annotations = False
+        self.image_dataset = None
+        self.default_parts = PARTIMAGENET_PARTS.get('Bird', [])
 
         # 1. Resolve image folder path (magic discovery)
         target_split = os.path.basename(image_folder.rstrip('/\\'))
@@ -331,10 +309,14 @@ class PartImageNetDataset(Dataset):
     def _init_imagefolder(self):
         """Fallback: use ImageFolder structure without annotations."""
         logger.info('No annotation file; using ImageFolder + default parts')
-        self.image_dataset = torchvision.datasets.ImageFolder(
-            root=self.image_folder)
+        if torchvision is not None:
+            self.image_dataset = torchvision.datasets.ImageFolder(
+                root=self.image_folder)
+        else:
+            logger.error('torchvision not available for ImageFolder fallback.')
+            self.image_dataset = []
         # Map class indices to default bird parts (most common in PartImageNet)
-        self.default_parts = ['head', 'body', 'wing', 'foot', 'tail']
+        self.default_parts = PARTIMAGENET_PARTS.get('Bird', [])
 
     def __len__(self):
         if self.has_annotations:
@@ -374,7 +356,7 @@ class PartImageNetDataset(Dataset):
             metadata = {'category_id': class_idx, 'supercategory': 'Unknown'}
 
         if self.transform is not None:
-            if not isinstance(image, torch.Tensor):
+            if torch is None or not isinstance(image, torch.Tensor):
                 image = self.transform(image)
 
         return image, part_labels, metadata
@@ -473,6 +455,9 @@ def make_partimagenet(
     collator = None
     if mask_collator is not None:
         collator = PartListingCollator(mask_collator)
+
+    if torch is None:
+        return dataset, None, None
 
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset=dataset,
