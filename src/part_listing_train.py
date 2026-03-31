@@ -4,438 +4,491 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# Part-Listing I-JEPA Training Script
-# Extends the I-JEPA training loop with text cross-attention and slot attention
+# Extended for Part-Listing I-JEPA: PartImageNet dataset with part labels
 
 import os
-
-# -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
-try:
-    os.environ['CUDA_VISIBLE_DEVICES'] = os.environ['SLURM_LOCALID']
-except Exception:
-    pass
-
-import copy
+import json
 import logging
 import sys
-import yaml
 
 import numpy as np
-
 import torch
-import torch.multiprocessing as mp
-import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel
+import torchvision
+from torch.utils.data import Dataset
 
-from src.masks.multiblock import MaskCollator as MBMaskCollator
-from src.masks.utils import apply_masks
-from src.utils.distributed import (
-    init_distributed,
-    AllReduce
-)
-from src.utils.logging import (
-    CSVLogger,
-    gpu_timer,
-    grad_logger,
-    AverageMeter)
-from src.utils.tensors import repeat_interleave_batch
-from src.datasets.part_listing_dataset import make_partimagenet
-from src.losses import PartListingLoss
-
-from src.helper import (
-    load_checkpoint,
-    init_part_listing_model,
-    init_part_listing_opt)
-from src.transforms import make_transforms
-
-# --
-log_timings = True
-log_freq = 10
-checkpoint_freq = 50
-# --
+from PIL import Image
 
 _GLOBAL_SEED = 0
-np.random.seed(_GLOBAL_SEED)
-torch.manual_seed(_GLOBAL_SEED)
-torch.backends.cudnn.benchmark = True
-
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
+# PartImageNet category-to-parts mapping
+# Based on PartImageNet benchmark (He et al., ECCV 2022)
+# 11 super-categories with part annotations
+PARTIMAGENET_PARTS = {
+    'Quadruped': ['head', 'body', 'foot', 'tail'],
+    'Biped': ['head', 'body', 'hand', 'foot', 'tail'],
+    'Fish': ['head', 'body', 'fin', 'tail'],
+    'Bird': ['head', 'body', 'wing', 'foot', 'tail'],
+    'Snake': ['head', 'body'],
+    'Reptile': ['head', 'body', 'foot', 'tail'],
+    'Car': ['body', 'tier', 'side_mirror'],
+    'Bicycle': ['head', 'body', 'seat', 'tier'],
+    'Boat': ['body', 'sail'],
+    'Aeroplane': ['head', 'body', 'wing', 'engine', 'tail'],
+    'Bottle': ['body', 'mouth'],
+}
 
-def main(args, resume_preempt=False):
+# Flattened unique part labels (for vocabulary)
+ALL_PART_LABELS = sorted(set(
+    part for parts in PARTIMAGENET_PARTS.values() for part in parts
+))
 
-    # ----------------------------------------------------------------------- #
-    #  PASSED IN PARAMS FROM CONFIG FILE
-    # ----------------------------------------------------------------------- #
+# Mapping from common ImageNet synsets to PartImageNet supercategories
+# This covers the 158 classes used in the benchmark.
+SYNSET_TO_SUPERCATEGORY = {
+    # Quadruped (n02084071: Dog, n02121808: Cat, etc.)
+    'n02084071': 'Quadruped', 'n02099601': 'Quadruped', 'n02100230': 'Quadruped',
+    'n02100877': 'Quadruped', 'n02101388': 'Quadruped', 'n02105162': 'Quadruped',
+    'n02107381': 'Quadruped', 'n02108551': 'Quadruped', 'n02110185': 'Quadruped',
+    'n02130303': 'Quadruped', 'n02389033': 'Quadruped', 'n02391032': 'Quadruped',
+    'n02395406': 'Quadruped', 'n02396427': 'Quadruped', 'n02403003': 'Quadruped',
+    'n02410509': 'Quadruped', 'n02412361': 'Quadruped', 'n02443111': 'Quadruped',
+    'n02504013': 'Quadruped',
+    # Bird (n01503061: Owl, etc.)
+    'n01503061': 'Bird', 'n01614925': 'Bird', 'n01855672': 'Bird',
+    'n02005658': 'Bird', 'n02007558': 'Bird', 'n02013146': 'Bird',
+    'n02013627': 'Bird', 'n02018207': 'Bird', 'n02114421': 'Bird',
+    'n01491361': 'Bird', 'n01494475': 'Bird',
+    # Fish (n01440764: Tench, etc.)
+    'n01440764': 'Fish', 'n01443537': 'Fish', 'n01484850': 'Fish',
+    'n02512053': 'Fish', 'n02514041': 'Fish', 'n02531338': 'Fish',
+    # Aeroplane
+    'n02690373': 'Aeroplane', 'n02691149': 'Aeroplane', 'n02692856': 'Aeroplane',
+    # Car
+    'n02958343': 'Car', 'n04037443': 'Car', 'n04285008': 'Car',
+    'n03100240': 'Car', 'n03770679': 'Car', 'n04461632': 'Car',
+    # Bicycle / Boat / Bottle (Placeholder for typical ImageNet IDs)
+    'n02835271': 'Bicycle', 'n03792782': 'Bicycle',
+    'n02858304': 'Boat', 'n03141249': 'Boat',
+    'n03983393': 'Bottle', 'n03062238': 'Bottle'
+}
+# Note: In practice, we look at the first character of the filename to identify the synset.
 
-    # -- META
-    use_bfloat16 = args['meta']['use_bfloat16']
-    model_name = args['meta']['model_name']
-    load_model = args['meta']['load_checkpoint'] or resume_preempt
-    r_file = args['meta']['read_checkpoint']
-    copy_data = args['meta']['copy_data']
-    pred_depth = args['meta']['pred_depth']
-    pred_emb_dim = args['meta']['pred_emb_dim']
-    if not torch.cuda.is_available():
-        device = torch.device('cpu')
-    else:
-        device = torch.device('cuda:0')
-        torch.cuda.set_device(device)
 
-    # -- PART-LISTING PARAMS
-    use_part_listing = args['meta'].get('use_part_listing', True)
-    text_encoder_type = args['meta'].get('text_encoder_type', 'clip')
-    num_cross_attn_blocks = args['meta'].get('num_cross_attn_blocks', 2)
-    use_slot_attention = args['meta'].get('use_slot_attention', False)
-    num_slots = args['meta'].get('num_slots', 8)
-    slot_iters = args['meta'].get('slot_iters', 3)
-    slot_loss_weight = args['meta'].get('slot_loss_weight', 0.1)
-    diversity_loss_weight = args['meta'].get('diversity_loss_weight', 0.05)
-    clip_model_name = args['meta'].get(
-        'clip_model_name', 'openai/clip-vit-base-patch16')
+class PartImageNetDataset(Dataset):
+    """
+    PartImageNet dataset wrapper that returns images AND part labels.
 
-    # -- DATA
-    use_gaussian_blur = args['data']['use_gaussian_blur']
-    use_horizontal_flip = args['data']['use_horizontal_flip']
-    use_color_distortion = args['data']['use_color_distortion']
-    color_jitter = args['data']['color_jitter_strength']
-    # --
-    batch_size = args['data']['batch_size']
-    pin_mem = args['data']['pin_mem']
-    num_workers = args['data']['num_workers']
-    root_path = args['data']['root_path']
-    image_folder = args['data']['image_folder']
-    crop_size = args['data']['crop_size']
-    crop_scale = args['data']['crop_scale']
-    # -- Part-listing data params
-    annotation_file = args['data'].get('annotation_file', None)
+    Expected directory structure:
+        root_path/
+        ├── train/
+        │   ├── n01440764/
+        │   │   ├── n01440764_10026.JPEG
+        │   │   └── ...
+        │   └── ...
+        ├── val/
+        │   └── ...
+        └── annotations/
+            ├── train.json
+            └── val.json
 
-    # -- MASK
-    allow_overlap = args['mask']['allow_overlap']
-    patch_size = args['mask']['patch_size']
-    num_enc_masks = args['mask']['num_enc_masks']
-    min_keep = args['mask']['min_keep']
-    enc_mask_scale = args['mask']['enc_mask_scale']
-    num_pred_masks = args['mask']['num_pred_masks']
-    pred_mask_scale = args['mask']['pred_mask_scale']
-    aspect_ratio = args['mask']['aspect_ratio']
+    The annotation JSON follows COCO-style format with part segmentation:
+    {
+        "images": [...],
+        "annotations": [
+            {
+                "image_id": ...,
+                "category_id": ...,
+                "parts": [
+                    {"part_name": "head", "segmentation": [...]},
+                    {"part_name": "body", "segmentation": [...]},
+                    ...
+                ]
+            }
+        ],
+        "categories": [
+            {"id": ..., "name": "...", "supercategory": "Quadruped"},
+            ...
+        ]
+    }
 
-    # -- OPTIMIZATION
-    ema = args['optimization']['ema']
-    ipe_scale = args['optimization']['ipe_scale']
-    wd = float(args['optimization']['weight_decay'])
-    final_wd = float(args['optimization']['final_weight_decay'])
-    num_epochs = args['optimization']['epochs']
-    warmup = args['optimization']['warmup']
-    start_lr = args['optimization']['start_lr']
-    lr = args['optimization']['lr']
-    final_lr = args['optimization']['final_lr']
+    Args:
+        root_path: path to PartImageNet root directory
+        annotation_file: path to annotation JSON file
+        image_folder: relative path to image directory (e.g., 'train/')
+        transform: image transforms
+        supercategory_map: mapping from category to supercategory
+        train: whether this is training data
+        max_parts: maximum number of part labels to return
+    """
+    def __init__(
+        self,
+        root_path,
+        annotation_file=None,
+        image_folder='train/',
+        transform=None,
+        train=True,
+        max_parts=12,
+    ):
+        super().__init__()
+        self.root_path = root_path
+        # Allow image_folder to be absolute or relative
+        if os.path.isabs(image_folder):
+            self.image_folder = image_folder
+        else:
+            self.image_folder = os.path.join(root_path, image_folder)
+        
+        self.transform = transform
+        self.train = train
+        self.max_parts = max_parts
 
-    # -- LOGGING
-    folder = args['logging']['folder']
-    tag = args['logging']['write_tag']
+        # Determine if annotation_file is a directory (containing individual JSONs)
+        # or a file (COCO-style)
+        if annotation_file is not None and os.path.isdir(annotation_file):
+            logger.info(f'Walking directory for images/annotations: {self.image_folder}')
+            self.annotations = self._crawl_annotations(self.image_folder, annotation_file)
+            self.has_annotations = True
+        elif annotation_file is not None and os.path.isfile(annotation_file):
+            self.annotations = self._load_annotations(annotation_file)
+            self.has_annotations = True
+        else:
+            # Check for mixed directories or fall back
+            json_files = [f for f in os.listdir(self.image_folder) if f.endswith('.json') and not f.startswith('._')]
+            if len(json_files) > 10:
+                logger.info(f'Mixed directory detected. Crawling {self.image_folder}')
+                self.annotations = self._crawl_annotations(self.image_folder, self.image_folder)
+                self.has_annotations = True
+            else:
+                self.annotations = None
+                self.has_annotations = False
+                self._init_imagefolder()
 
-    dump = os.path.join(folder, 'params-part-listing-ijepa.yaml')
-    with open(dump, 'w') as f:
-        yaml.dump(args, f)
-    # ----------------------------------------------------------------------- #
+    def _crawl_annotations(self, image_folder, annotation_folder):
+        """Build annotation list by correctly matching images and annotations."""
+        annotations = []
+        
+        # Robust folder check
+        if not os.path.exists(image_folder):
+            logger.warning(f'Image folder not found: {image_folder}. Trying common patterns...')
+            
+            # Pattern 1: Try adding 'images' to the path if it's missing (PartImageNet_Seg/PartImageNet/train/ -> PartImageNet_Seg/PartImageNet/images/train/)
+            head, tail = os.path.split(image_folder.rstrip('/\\'))
+            alt_folder = os.path.join(head, 'images', tail)
+            if os.path.exists(alt_folder):
+                logger.info(f'Found alternate image folder (added /images/): {alt_folder}')
+                image_folder = alt_folder
+            
+            # Pattern 2: if image_folder is '.../annotations/train/', try '.../images/train/'
+            elif 'annotations' in image_folder:
+                alt_folder = image_folder.replace('annotations', 'images')
+                if os.path.exists(alt_folder):
+                    logger.info(f'Found alternate image folder (annotations -> images): {alt_folder}')
+                    image_folder = alt_folder
+            
+            # Pattern 3: Try looking for 'images/train' under root_path
+            else:
+                alt_folder = os.path.join(self.root_path, 'images', 'train')
+                if os.path.exists(alt_folder):
+                    logger.info(f'Found alternate image folder (root/images/train): {alt_folder}')
+                    image_folder = alt_folder
 
-    try:
-        mp.set_start_method('spawn')
-    except Exception:
-        pass
+        # Collect all image files recursively to handle nested synset folders
+        image_files = []
+        img_exts = ('.JPEG', '.jpg', '.jpeg', '.JPG', '.png', '.PNG')
+        if os.path.exists(image_folder):
+            for root, _, files in os.walk(image_folder):
+                if '__MACOSX' in root: continue
+                # Also skip 'annotations' folders if we accidentally walk into them
+                if 'annotations' in root.lower(): continue
+                
+                for f in files:
+                    if f.lower().endswith(img_exts) and not f.startswith('._'):
+                        # Skip files that look like masks if in the same folder
+                        if not f.endswith('_mask.png') and '_mask' not in f:
+                            image_files.append(os.path.join(root, f))
+        else:
+            logger.error(f'Could not find image folder: {image_folder}')
 
-    # -- init torch distributed backend
-    world_size, rank = init_distributed()
-    logger.info(f'Initialized (rank/world-size) {rank}/{world_size}')
-    if rank > 0:
-        logger.setLevel(logging.ERROR)
+        logger.info(f'Identified {len(image_files)} candidate images')
 
-    # -- log/checkpointing paths
-    log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
-    save_path = os.path.join(folder, f'{tag}' + '-ep{epoch}.pth.tar')
-    latest_path = os.path.join(folder, f'{tag}-latest.pth.tar')
-    load_path = None
-    if load_model:
-        load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+        for img_path in image_files:
+            base_name = os.path.basename(img_path)
+            base_stem = os.path.splitext(base_name)[0]
+            
+            # Find matching JSON
+            # First try direct match in annotation_folder
+            json_name = base_stem + '.json'
+            json_path = os.path.join(annotation_folder, json_name)
+            
+            # If not found, try recursive search or parallel structure
+            if not os.path.exists(json_path):
+                # Try adding the relative path structure from images to annotations
+                # i.e. images/train/n0144/img.JPEG -> annotations/train/n0144/img.json
+                rel_path = os.path.relpath(img_path, image_folder)
+                json_path = os.path.join(annotation_folder, os.path.splitext(rel_path)[0] + '.json')
 
-    # -- make csv_logger with additional part-listing fields
-    csv_logger = CSVLogger(log_file,
-                           ('%d', 'epoch'),
-                           ('%d', 'itr'),
-                           ('%.5f', 'loss'),
-                           ('%.5f', 'jepa_loss'),
-                           ('%.5f', 'slot_loss'),
-                           ('%.5f', 'div_loss'),
-                           ('%.5f', 'mask-A'),
-                           ('%.5f', 'mask-B'),
-                           ('%d', 'time (ms)'))
+            # Extract synset from filename (e.g. n01440764_10029 -> n01440764)
+            synset = base_stem.split('_')[0]
+            super_cat = SYNSET_TO_SUPERCATEGORY.get(synset, 'Unknown')
+            
+            # Additional heuristic fallbacks
+            if super_cat == 'Unknown':
+                if synset.startswith('n015') or synset.startswith('n016'): super_cat = 'Bird'
+                elif synset.startswith('n014'): super_cat = 'Fish'
+                elif synset.startswith('n020') or synset.startswith('n021'): super_cat = 'Quadruped'
 
-    # -- init model (with part-listing extensions)
-    encoder, predictor, text_encoder = init_part_listing_model(
-        device=device,
-        patch_size=patch_size,
-        crop_size=crop_size,
-        pred_depth=pred_depth,
-        pred_emb_dim=pred_emb_dim,
-        model_name=model_name,
-        text_encoder_type=text_encoder_type,
-        num_cross_attn_blocks=num_cross_attn_blocks,
-        use_slot_attention=use_slot_attention,
-        num_slots=num_slots,
-        slot_iters=slot_iters,
-        clip_model_name=clip_model_name)
-    target_encoder = copy.deepcopy(encoder)
+            # Parts to return
+            parts = PARTIMAGENET_PARTS.get(super_cat, ['body'])
+            
+            annotations.append({
+                'image_path': img_path,
+                'json_path': json_path if os.path.exists(json_path) else None,
+                'parts': list(parts[:self.max_parts]),
+                'category_id': synset,
+                'supercategory': super_cat,
+            })
+            
+        if len(annotations) == 0:
+            logger.error(f'Crawl failed to find any valid images in {image_folder}')
+            
+        logger.info(f'Successfully crawled {len(annotations)} items')
+        return annotations
 
-    # -- init loss function
-    loss_fn = PartListingLoss(
-        slot_loss_weight=slot_loss_weight,
-        diversity_loss_weight=diversity_loss_weight,
-        use_slot_loss=use_slot_attention,
+    def _load_annotations(self, annotation_file):
+        """Load PartImageNet COCO-style annotations."""
+        logger.info(f'Loading PartImageNet annotations from {annotation_file}')
+        with open(annotation_file, 'r') as f:
+            data = json.load(f)
+
+        # Build image_id -> image info mapping
+        images = {img['id']: img for img in data['images']}
+
+        # Build category_id -> supercategory mapping
+        cat_to_super = {}
+        for cat in data.get('categories', []):
+            cat_to_super[cat['id']] = cat.get('supercategory', 'Unknown')
+
+        # Build per-image annotations with part labels
+        annotations = []
+        for ann in data.get('annotations', []):
+            img_info = images.get(ann['image_id'])
+            if img_info is None:
+                continue
+
+            # Resolve image path
+            img_name = img_info.get('file_name', img_info.get('filename', ''))
+            if not img_name:
+                continue
+            
+            # Try to find the image in image_folder
+            img_path = os.path.join(self.image_folder, img_name)
+            if not os.path.exists(img_path):
+                # Try recursive search if flat match fails
+                found = False
+                for root, _, files in os.walk(self.image_folder):
+                    if img_name in files:
+                        img_path = os.path.join(root, img_name)
+                        found = True
+                        break
+                if not found:
+                    continue
+
+            # Get part names from annotation
+            parts = []
+            if 'parts' in ann:
+                for part in ann['parts']:
+                    part_name = part.get('part_name', part.get('name', ''))
+                    if part_name:
+                        parts.append(part_name.lower().strip())
+
+            # If no explicit parts, infer from supercategory
+            synset = img_name.split('_')[0]
+            super_cat = cat_to_super.get(ann.get('category_id'), 'Unknown')
+            if super_cat == 'Unknown':
+                super_cat = SYNSET_TO_SUPERCATEGORY.get(synset, 'Unknown')
+            
+            if not parts:
+                parts = PARTIMAGENET_PARTS.get(super_cat, ['body'])
+
+            # Deduplicate while preserving order
+            seen = set()
+            unique_parts = []
+            for p in parts:
+                if p not in seen:
+                    seen.add(p)
+                    unique_parts.append(p)
+
+            annotations.append({
+                'image_path': img_path,
+                'parts': list(unique_parts[:self.max_parts]),
+                'category_id': synset,
+                'supercategory': super_cat,
+            })
+
+        logger.info(f'Loaded {len(annotations)} PartImageNet annotations')
+        return annotations
+
+    def _init_imagefolder(self):
+        """Fallback: use ImageFolder structure without annotations."""
+        logger.info('No annotation file; using ImageFolder + default parts')
+        self.image_dataset = torchvision.datasets.ImageFolder(
+            root=self.image_folder)
+        # Map class indices to default bird parts (most common in PartImageNet)
+        self.default_parts = ['head', 'body', 'wing', 'foot', 'tail']
+
+    def __len__(self):
+        if self.has_annotations:
+            return len(self.annotations)
+        return len(self.image_dataset)
+
+    def __getitem__(self, idx):
+        """
+        Returns:
+        image: transformed image tensor
+        part_labels: list of part-label strings
+        metadata: dict with category info
+        """
+        if self.has_annotations:
+            ann = self.annotations[idx]
+            img_path = ann['image_path']
+            
+            # Robust loading with fallback
+            try:
+                # Extra check for macOS resource fork files
+                if os.path.basename(img_path).startswith('._') or '__MACOSX' in img_path:
+                    raise IOError("Invalid macOS resource fork")
+                    
+                image = Image.open(img_path).convert('RGB')
+            except Exception as e:
+                logger.warning(f'Failed to load image {img_path}: {e}. Returning placeholder.')
+                image = Image.new('RGB', (224, 224), (128, 128, 128))
+            
+            part_labels = ann['parts']
+            metadata = {
+                'category_id': ann['category_id'],
+                'supercategory': ann['supercategory'],
+            }
+        else:
+            image, class_idx = self.image_dataset[idx]
+            part_labels = self.default_parts
+            metadata = {'category_id': class_idx, 'supercategory': 'Unknown'}
+
+        if self.transform is not None:
+            if not isinstance(image, torch.Tensor):
+                image = self.transform(image)
+
+        return image, part_labels, metadata
+
+
+class PartListingCollator:
+    """
+    Custom collator that handles part labels alongside the mask collator.
+
+    Wraps the MaskCollator to additionally process part-label strings
+    alongside the standard image + mask collation.
+
+    Args:
+        mask_collator: the base MaskCollator from I-JEPA
+    """
+    def __init__(self, mask_collator):
+        self.mask_collator = mask_collator
+
+    def step(self):
+        """Delegate step to mask collator."""
+        return self.mask_collator.step()
+
+    def __call__(self, batch):
+        """
+        Collate images, masks, and part labels.
+
+        Args:
+            batch: list of (image, part_labels, metadata) tuples
+
+        Returns:
+            collated_images: batched image tensor [B, C, H, W]
+            masks_enc: encoder masks
+            masks_pred: predictor masks
+            part_labels: list of part-label lists (one per sample)
+        """
+        images = [item[0] for item in batch]
+        part_labels = [item[1] for item in batch]
+        # metadata not needed during training, but kept for debugging
+
+        # Use the mask collator on images only
+        # The mask collator expects [(image, label)] tuples from ImageFolder
+        # We wrap images to match expected format
+        image_batch = [(img, 0) for img in images]
+
+        collated_batch, masks_enc, masks_pred = self.mask_collator(image_batch)
+
+        return collated_batch, masks_enc, masks_pred, part_labels
+
+
+def make_partimagenet(
+    transform,
+    batch_size,
+    mask_collator=None,
+    pin_mem=True,
+    num_workers=8,
+    world_size=1,
+    rank=0,
+    root_path=None,
+    image_folder='train/',
+    annotation_file=None,
+    training=True,
+    drop_last=True,
+):
+    """
+    Create PartImageNet data loader with part-label support.
+
+    Args:
+        transform: image transforms
+        batch_size: batch size per GPU
+        mask_collator: MaskCollator for I-JEPA masking
+        pin_mem: pin CPU memory for faster GPU transfer
+        num_workers: number of data loading workers
+        world_size: number of distributed processes
+        rank: current process rank
+        root_path: PartImageNet root directory
+        image_folder: relative path to images
+        annotation_file: path to COCO-style annotation JSON
+        training: whether loading training data
+        drop_last: whether to drop incomplete last batch
+
+    Returns:
+        dataset: PartImageNetDataset instance
+        data_loader: DataLoader instance
+        sampler: DistributedSampler instance
+    """
+    dataset = PartImageNetDataset(
+        root_path=root_path,
+        annotation_file=annotation_file,
+        image_folder=image_folder,
+        transform=transform,
+        train=training,
     )
+    logger.info(f'PartImageNet dataset created with {len(dataset)} samples')
 
-    # -- make data transforms
-    mask_collator = MBMaskCollator(
-        input_size=crop_size,
-        patch_size=patch_size,
-        pred_mask_scale=pred_mask_scale,
-        enc_mask_scale=enc_mask_scale,
-        aspect_ratio=aspect_ratio,
-        nenc=num_enc_masks,
-        npred=num_pred_masks,
-        allow_overlap=allow_overlap,
-        min_keep=min_keep)
+    # Wrap mask collator with part-label collation
+    collator = None
+    if mask_collator is not None:
+        collator = PartListingCollator(mask_collator)
 
-    transform = make_transforms(
-        crop_size=crop_size,
-        crop_scale=crop_scale,
-        gaussian_blur=use_gaussian_blur,
-        horizontal_flip=use_horizontal_flip,
-        color_distortion=use_color_distortion,
-        color_jitter=color_jitter)
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        dataset=dataset,
+        num_replicas=world_size,
+        rank=rank)
 
-    # -- init data-loaders/samplers (PartImageNet)
-    _, unsupervised_loader, unsupervised_sampler = make_partimagenet(
-            transform=transform,
-            batch_size=batch_size,
-            mask_collator=mask_collator,
-            pin_mem=pin_mem,
-            training=True,
-            num_workers=num_workers,
-            world_size=world_size,
-            rank=rank,
-            root_path=root_path,
-            image_folder=image_folder,
-            annotation_file=annotation_file,
-            drop_last=True)
-    ipe = len(unsupervised_loader)
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        collate_fn=collator,
+        sampler=sampler,
+        batch_size=batch_size,
+        drop_last=drop_last,
+        pin_memory=pin_mem,
+        num_workers=num_workers,
+        persistent_workers=False)
 
-    # -- init optimizer and scheduler
-    optimizer, scaler, scheduler, wd_scheduler = init_part_listing_opt(
-        encoder=encoder,
-        predictor=predictor,
-        text_encoder=text_encoder,
-        wd=wd,
-        final_wd=final_wd,
-        start_lr=start_lr,
-        ref_lr=lr,
-        final_lr=final_lr,
-        iterations_per_epoch=ipe,
-        warmup=warmup,
-        num_epochs=num_epochs,
-        ipe_scale=ipe_scale,
-        use_bfloat16=use_bfloat16)
-
-    encoder = DistributedDataParallel(encoder, static_graph=True)
-    predictor = DistributedDataParallel(predictor, static_graph=True)
-    target_encoder = DistributedDataParallel(target_encoder)
-    for p in target_encoder.parameters():
-        p.requires_grad = False
-
-    # Note: text_encoder is NOT wrapped in DDP if frozen (CLIP)
-    # If using learned encoder, wrap it
-    if text_encoder_type == 'learned':
-        text_encoder = DistributedDataParallel(text_encoder, static_graph=True)
-
-    # -- momentum schedule
-    momentum_scheduler = (ema[0] + i*(ema[1]-ema[0])/(ipe*num_epochs*ipe_scale)
-                          for i in range(int(ipe*num_epochs*ipe_scale)+1))
-
-    start_epoch = 0
-    # -- load training checkpoint
-    if load_model:
-        encoder, predictor, target_encoder, optimizer, scaler, start_epoch = load_checkpoint(
-            device=device,
-            r_path=load_path,
-            encoder=encoder,
-            predictor=predictor,
-            target_encoder=target_encoder,
-            opt=optimizer,
-            scaler=scaler)
-        for _ in range(start_epoch*ipe):
-            scheduler.step()
-            wd_scheduler.step()
-            next(momentum_scheduler)
-            mask_collator.step()
-
-    def save_checkpoint(epoch):
-        save_dict = {
-            'encoder': encoder.state_dict(),
-            'predictor': predictor.state_dict(),
-            'target_encoder': target_encoder.state_dict(),
-            'text_encoder': text_encoder.state_dict() if hasattr(text_encoder, 'state_dict') else None,
-            'opt': optimizer.state_dict(),
-            'scaler': None if scaler is None else scaler.state_dict(),
-            'epoch': epoch,
-            'loss': loss_meter.avg,
-            'batch_size': batch_size,
-            'world_size': world_size,
-            'lr': lr
-        }
-        if rank == 0:
-            torch.save(save_dict, latest_path)
-            if (epoch + 1) % checkpoint_freq == 0:
-                torch.save(save_dict, save_path.format(epoch=f'{epoch + 1}'))
-
-    # -- TRAINING LOOP
-    for epoch in range(start_epoch, num_epochs):
-        logger.info('Epoch %d' % (epoch + 1))
-
-        # -- update distributed-data-loader epoch
-        unsupervised_sampler.set_epoch(epoch)
-
-        loss_meter = AverageMeter()
-        jepa_loss_meter = AverageMeter()
-        slot_loss_meter = AverageMeter()
-        div_loss_meter = AverageMeter()
-        maskA_meter = AverageMeter()
-        maskB_meter = AverageMeter()
-        time_meter = AverageMeter()
-
-        for itr, (udata, masks_enc, masks_pred, part_labels) in enumerate(unsupervised_loader):
-
-            def load_imgs():
-                # -- unsupervised imgs
-                imgs = udata[0].to(device, non_blocking=True)
-                masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
-                masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
-                return (imgs, masks_1, masks_2)
-            imgs, masks_enc, masks_pred = load_imgs()
-            maskA_meter.update(len(masks_enc[0][0]))
-            maskB_meter.update(len(masks_pred[0][0]))
-
-            def train_step():
-                _new_lr = scheduler.step()
-                _new_wd = wd_scheduler.step()
-
-                def forward_target():
-                    with torch.no_grad():
-                        h = target_encoder(imgs)
-                        h = F.layer_norm(h, (h.size(-1),))
-                        B = len(h)
-                        h = apply_masks(h, masks_pred)
-                        h = repeat_interleave_batch(h, B, repeat=len(masks_enc))
-                        return h
-
-                def forward_context():
-                    # Encode visible context patches
-                    z = encoder(imgs, masks_enc)
-
-                    # Encode part labels (text)
-                    text_embeds = text_encoder(part_labels, device=device)
-
-                    # Predict target representations with text conditioning
-                    z_pred, slot_out, cross_attn_maps = predictor(
-                        z, masks_enc, masks_pred, text_embeds=text_embeds)
-
-                    return z_pred, slot_out, text_embeds
-
-                def compute_loss(z_pred, h, slot_out, text_embeds):
-                    total_loss, loss_dict = loss_fn(
-                        z_pred, h,
-                        slot_out=slot_out,
-                        text_embeds=text_embeds)
-                    total_loss = AllReduce.apply(total_loss)
-                    return total_loss, loss_dict
-
-                # Step 1. Forward
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
-                    h = forward_target()
-                    z_pred, slot_out, text_embeds = forward_context()
-                    loss, loss_dict = compute_loss(z_pred, h, slot_out, text_embeds)
-
-                # Step 2. Backward & step
-                if use_bfloat16:
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    optimizer.step()
-                grad_stats = grad_logger(encoder.named_parameters())
-                optimizer.zero_grad()
-
-                # Step 3. Momentum update of target encoder
-                with torch.no_grad():
-                    m = next(momentum_scheduler)
-                    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
-                        param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
-
-                return (float(loss), loss_dict, _new_lr, _new_wd, grad_stats)
-
-            (loss, loss_dict, _new_lr, _new_wd, grad_stats), etime = gpu_timer(train_step)
-            loss_meter.update(loss)
-            jepa_loss_meter.update(loss_dict.get('jepa_loss', 0.))
-            slot_loss_meter.update(loss_dict.get('slot_assign_loss', 0.))
-            div_loss_meter.update(loss_dict.get('diversity_loss', 0.))
-            time_meter.update(etime)
-
-            # -- Logging
-            def log_stats():
-                csv_logger.log(
-                    epoch + 1, itr, loss,
-                    loss_dict.get('jepa_loss', 0.),
-                    loss_dict.get('slot_assign_loss', 0.),
-                    loss_dict.get('diversity_loss', 0.),
-                    maskA_meter.val, maskB_meter.val, etime)
-                if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
-                    logger.info(
-                        '[%d, %5d] loss: %.3f (jepa: %.3f, slot: %.3f, div: %.3f) '
-                        'masks: %.1f %.1f '
-                        '[wd: %.2e] [lr: %.2e] '
-                        '[mem: %.2e] '
-                        '(%.1f ms)'
-                        % (epoch + 1, itr,
-                           loss_meter.avg,
-                           jepa_loss_meter.avg,
-                           slot_loss_meter.avg,
-                           div_loss_meter.avg,
-                           maskA_meter.avg,
-                           maskB_meter.avg,
-                           _new_wd,
-                           _new_lr,
-                           torch.cuda.max_memory_allocated() / 1024.**2,
-                           time_meter.avg))
-
-                    if grad_stats is not None:
-                        logger.info('[%d, %5d] grad_stats: [%.2e %.2e] (%.2e, %.2e)'
-                                    % (epoch + 1, itr,
-                                       grad_stats.first_layer,
-                                       grad_stats.last_layer,
-                                       grad_stats.min,
-                                       grad_stats.max))
-
-            log_stats()
-
-            assert not np.isnan(loss), 'loss is nan'
-
-        # -- Save Checkpoint after every epoch
-        logger.info('avg. loss %.3f (jepa: %.3f, slot: %.3f, div: %.3f)'
-                     % (loss_meter.avg, jepa_loss_meter.avg,
-                        slot_loss_meter.avg, div_loss_meter.avg))
-        save_checkpoint(epoch+1)
-
-
-if __name__ == "__main__":
-    main()
+    logger.info('PartImageNet data loader created')
+    return dataset, data_loader, sampler
