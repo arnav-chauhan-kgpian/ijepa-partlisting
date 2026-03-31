@@ -1,154 +1,115 @@
-# I-JEPA
+# Part-Listing I-JEPA
 
-Official PyTorch codebase for I-JEPA (the **Image-based Joint-Embedding Predictive Architecture**) published @ CVPR-23.
-[\[arXiv\]](https://arxiv.org/pdf/2301.08243.pdf) [\[JEPAs\]](https://ai.facebook.com/blog/yann-lecun-advances-in-ai-research/) [\[blogpost\]](https://ai.facebook.com/blog/yann-lecun-ai-model-i-jepa/)
+**Part-Listing I-JEPA** is an extension of the original **Image-based Joint-Embedding Predictive Architecture (I-JEPA)** that introduces **semantic part-listing abilities**. By integrating multimodally-conditioned cross-attention and object-centric slot attention, the model aligns visual patch representations with semantic part labels (e.g., from PartImageNet), enabling more semantically grounded and interpretable self-supervised learning.
 
-## Method
-I-JEPA is a method for self-supervised learning. At a high level, I-JEPA predicts the representations of part of an image from the representations of other parts of the same image. Notably, this approach learns semantic image features:
-1. without relying on pre-specified invariances to hand-crafted data transformations, which tend to be biased for particular downstream tasks,
-2. and without having the model fill in pixel-level details, which tend to result in learning less semantically meaningful representations.
+[\[I-JEPA Paper (CVPR-23)\]](https://arxiv.org/pdf/2301.08243.pdf) [\[TI-JEPA Paper\]](d:\ijepa\TI_JEPA.pdf) [\[PartImageNet Dataset\]](https://arxiv.org/abs/2112.00933)
 
-![ijepa](https://github.com/facebookresearch/ijepa/assets/7530871/dbad94ab-ac35-433b-8b4c-ca227886d311)
+---
 
-## Visualizations
+## Key Features
 
-As opposed to generative methods that have a pixel decoder, I-JEPA has a predictor that makes predictions in latent space.
-The predictor in I-JEPA can be seen as a primitive (and restricted) world-model that is able to model spatial uncertainty in a static image from a partially observable context.
-This world model is semantic in the sense that it predicts high level information about unseen regions in the image, rather than pixel-level details.
+### 1. Semantic Part-Listing (TI-JEPA Inspired)
+Introduces a **Text-Conditioned Predictor** that uses cross-attention to bridge the gap between image patches and part-label embeddings. 
+- **Q**: Image context embeddings
+- **K/V**: Part-label text embeddings (from a frozen CLIP encoder)
+- This allows the predictor to become "aware" of the semantic parts it is expected to reconstruct in the latent space.
 
-We trained a stochastic decoder that maps the I-JEPA predicted representations back in pixel space as sketches.
-The model correctly captures positional uncertainty and produces high-level object parts with the correct pose (e.g., dog’s head, wolf’s front legs).
+### 2. Object-Centric Slot Attention
+Integrates an optional **Slot Attention** module within the predictor for unsupervised part decomposition.
+- Competitive binding mechanism groups image tokens into a fixed set of "slots".
+- Encourages the model to learn spatially coherent, object-centric representations.
+- Optimized with a **Slot-Part Assignment Loss** (Hungarian Matching) and **Slot Diversity Loss**.
 
-![ijepa-predictor-sketch](https://github.com/facebookresearch/ijepa/assets/7530871/9b66e461-fc8b-4b12-9f06-63ec4dfc1452)
-<sub>
-Caption: Illustrating how the predictor learns to model the semantics of the world. For each image, the portion outside of the blue box is encoded and given to the predictor as context. The predictor outputs a representation for what it expects to be in the region within the blue box. To visualize the prediction, we train a generative model that produces a sketch of the contents represented by the predictor output, and we show a sample output within the blue box. The predictor recognizes the semantics of what parts should be filled in (the top of the dog’s head, the bird’s leg, the wolf’s legs, the other side of the building).
-</sub>
+### 3. PartImageNet Alignment
+Full support for the **PartImageNet** dataset, including:
+- COCO-style annotation parsing.
+- Supercategory-to-parts mapping (Quadruped, Bird, Car, Aeroplane, etc.).
+- Custom collator for combined image-mask-label processing.
 
-## Evaluations
+---
 
-I-JEPA pretraining is also computationally efficient.
-It does not involve any overhead associated with applying more computationally intensive data augmentations to produce multiple views.
-Only one view of the image needs to be processed by the target encoder, and only the context blocks need to be processed by the context encoder.
-Empirically, I-JEPA learns strong off-the-shelf semantic representations without the use of hand-crafted view augmentations.
+## Architecture
 
-![1percenteval](https://github.com/facebookresearch/ijepa/assets/7530871/e6e5291f-ca51-43a4-a6cf-069811094ece)
-![lineareval](https://github.com/facebookresearch/ijepa/assets/7530871/d8cffa73-5350-444e-987a-7e131a86d767)
-
-
-## Pretrained models
-
-<table>
-  <tr>
-    <th colspan="1">arch.</th>
-    <th colspan="1">patch size</th>
-    <th colspan="1">resolution</th>
-    <th colspan="1">epochs</th>
-    <th colspan="1">data</th>
-    <th colspan="3">download</th>
-  </tr>
-  <tr>
-    <td>ViT-H</td>
-    <td>14x14</td>
-    <td>224x224</td>
-    <td>300</td>
-    <td>ImageNet-1K</td>
-    <td><a href="https://dl.fbaipublicfiles.com/ijepa/IN1K-vit.h.14-300e.pth.tar">full checkpoint</a></td>
-    <td><a href="https://dl.fbaipublicfiles.com/ijepa/IN1K-vit.h.14-logs-rank.0.csv">logs</a></td>
-    <td><a href="https://github.com/facebookresearch/ijepa/blob/main/configs/in1k_vith14_ep300.yaml">configs</a></td>
-  </tr>
-  <tr>
-    <td>ViT-H</td>
-    <td>16x16</td>
-    <td>448x448</td>
-    <td>300</td>
-    <td>ImageNet-1K</td>
-    <td><a href="https://dl.fbaipublicfiles.com/ijepa/IN1K-vit.h.16-448px-300e.pth.tar">full checkpoint</a></td>
-    <td><a href="https://dl.fbaipublicfiles.com/ijepa/IN1K-vit.h.16.448-logs-rank.0.csv">logs</a></td>
-    <td><a href="https://github.com/facebookresearch/ijepa/blob/main/configs/in1k_vith16-448_ep300.yaml">configs</a></td>
-  </tr>
-  <tr>
-    <td>ViT-H</td>
-    <td>14x14</td>
-    <td>224x224</td>
-    <td>66</td>
-    <td>ImageNet-22K</td>
-    <td><a href="https://dl.fbaipublicfiles.com/ijepa/IN22K-vit.h.14-900e.pth.tar">full checkpoint</a></td>
-    <td><a href="https://dl.fbaipublicfiles.com/ijepa/IN22K-vit.h.14-logs-rank.0.csv">logs</a></td>
-    <td><a href="https://github.com/facebookresearch/ijepa/blob/main/configs/in22k_vith14_ep66.yaml">configs</a></td>
-  </tr>
-  <tr>
-    <td>ViT-g</td>
-    <td>16x16</td>
-    <td>224x224</td>
-    <td>44</td>
-    <td>ImageNet-22K</td>
-    <td><a href="https://dl.fbaipublicfiles.com/ijepa/IN22K-vit.g.16-600e.pth.tar">full checkpoint</a></td>
-    <td><a href="https://dl.fbaipublicfiles.com/ijepa/IN22K-vit.g.16-logs-rank.0.csv">logs</a></td>
-    <td><a href="https://github.com/facebookresearch/ijepa/blob/main/configs/in22k_vitg16_ep44.yaml">configs</a></td>
-  </tr>
-</table>
-
-## Code Structure
-
-```
-.
-├── configs                   # directory in which all experiment '.yaml' configs are stored
-├── src                       # the package
-│   ├── train.py              #   the I-JEPA training loop
-│   ├── helper.py             #   helper functions for init of models & opt/loading checkpoint
-│   ├── transforms.py         #   pre-train data transforms
-│   ├── datasets              #   datasets, data loaders, ...
-│   ├── models                #   model definitions
-│   ├── masks                 #   mask collators, masking utilities, ...
-│   └── utils                 #   shared utilities
-├── main_distributed.py       # entrypoint for launch distributed I-JEPA pretraining on SLURM cluster
-└── main.py                   # entrypoint for launch I-JEPA pretraining locally on your machine
-```
-
-**Config files:**
-Note that all experiment parameters are specified in config files (as opposed to command-line-arguments). See the [configs/](configs/) directory for example config files.
-
-## Launching I-JEPA pretraining
-
-### Single-GPU training
-This implementation starts from the [main.py](main.py), which parses the experiment config file and runs the pre-training locally on a multi-GPU (or single-GPU) machine. For example, to run I-JEPA pretraining on GPUs "0","1", and "2" on a local machine using the config [configs/in1k_vith14_ep300.yaml](configs/in1k_vith14_ep300.yaml), type the command:
-```
-python main.py \
-  --fname configs/in1k_vith14_ep300.yaml \
-  --devices cuda:0 cuda:1 cuda:2
-```
-*Note: This example is just used for illustrative purposes, as the ViT-H/14 config should be run on 16 A100 80G GPUs for an effective batch-size of 2048, in order to reproduce our results.*
-
-### Multi-GPU training
-In the multi-GPU setting, the implementation starts from [main_distributed.py](main_distributed.py), which, in addition to parsing the config file, also allows for specifying details about distributed training. For distributed training, we use the popular open-source [submitit](https://github.com/facebookincubator/submitit) tool and provide examples for a SLURM cluster.
-
-For example, to pre-train on 16 A100 80G GPUs using the pre-training experiment configs specificed inside [configs/in1k_vith14_ep300.yaml](configs/in1k_vith14_ep300.yaml), type the command:
-```
-python main_distributed.py \
-  --fname configs/in1k_vith14_ep300.yaml \
-  --folder $path_to_save_submitit_logs \
-  --partition $slurm_partition \
-  --nodes 2 --tasks-per-node 8 \
-  --time 1000
+```mermaid
+graph TD
+    IMG[Image] --> ENC[ViT Encoder<br/>frozen target + online]
+    ENC -->|context patches| PRED[PartListingPredictor]
+    
+    PARTS[Part Labels<br/>head, wing, tail...] --> TEXT[TextEncoder<br/>Frozen CLIP]
+    TEXT -->|text embeddings| CA[CrossAttention Blocks<br/>Q=image, KV=text]
+    
+    CA --> SA_BLOCKS[Self-Attention Blocks]
+    SA_BLOCKS --> NORM[LayerNorm]
+    
+    NORM -->|mask tokens| PROJ[Predictor Projection<br/>→ D_enc]
+    PROJ --> JEPA_LOSS[JEPA Loss]
+    
+    NORM -.->|optional| SLOT[Slot Attention]
+    SLOT -.-> SLOT_LOSS[Slot-Part Loss<br/>+ Diversity Loss]
+    
+    ENC -->|target patches| JEPA_LOSS
+    TEXT -.-> SLOT_LOSS
 ```
 
 ---
 
-### Requirements
-* Python 3.8 (or newer)
-* PyTorch 2.0
-* torchvision
-* Other dependencies: pyyaml, numpy, opencv, submitit
+## Code Structure Extensions
+
+The original I-JEPA codebase is preserved, with the following extensions:
+
+```
+.
+├── src/models/
+│   ├── cross_attention.py       # New: TI-JEPA-style multimodal fusion
+│   ├── slot_attention.py        # New: Iterative competitive binding
+│   ├── text_encoder.py          # New: CLIP-based part label encoder
+│   └── part_listing_predictor.py # New: Unified predictor with slots/cross-attn
+├── src/datasets/
+│   └── part_listing_dataset.py  # New: PartImageNet integration
+├── src/losses.py                # Updated: Slot assignment & diversity losses
+├── src/part_listing_train.py     # New: Multi-modal training loop
+├── main_part_listing.py         # New: Local entry point for part-listing
+└── configs/
+    └── part_listing_vitb16_ep100.yaml # New: Part-listing hyperparameters
+```
+
+---
+
+## Quick Start
+
+### 1. Requirements
+- PyTorch 2.0+
+- torchvision
+- `transformers` (for CLIP text encoder)
+- `pyyaml`, `numpy`, `scipy`
+
+### 2. Launch Training
+To run Part-Listing I-JEPA pre-training locally:
+```bash
+python main_part_listing.py \
+  --fname configs/part_listing_vitb16_ep100.yaml \
+  --devices cuda:0
+```
+
+### 3. Run Verification Tests
+We provide a comprehensive test suite to verify the new modules:
+```bash
+python tests/test_part_listing.py
+```
+
+---
 
 ## License
-See the [LICENSE](./LICENSE) file for details about the license under which this code is made available.
+See the [LICENSE](./LICENSE) file for details about the original I-JEPA license.
 
 ## Citation
-If you find this repository useful in your research, please consider giving a star :star: and a citation
-```
+If you use this part-listing extension, please cite both the original I-JEPA work and the relevant part-based architectures:
+
+```bibtex
 @article{assran2023self,
   title={Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture},
   author={Assran, Mahmoud and Duval, Quentin and Misra, Ishan and Bojanowski, Piotr and Vincent, Pascal and Rabbat, Michael and LeCun, Yann and Ballas, Nicolas},
   journal={arXiv preprint arXiv:2301.08243},
   year={2023}
 }
+```
