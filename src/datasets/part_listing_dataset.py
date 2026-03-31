@@ -162,10 +162,21 @@ class PartImageNetDataset(Dataset):
     def _crawl_annotations(self, folder):
         """Build annotation list by scanning individual JSON/PNG pairs."""
         annotations = []
+
+        # Skip __MACOSX directories entirely
+        if '__MACOSX' in folder:
+            logger.info(f'Skipping __MACOSX directory: {folder}')
+            return annotations
+
         files = os.listdir(folder)
         # Find all images (assuming .png or .JPEG as reported)
         img_exts = ('.png', '.JPEG', '.jpg', '.jpeg', '.JPG', '.PNG')
-        image_files = [f for f in files if f.endswith(img_exts) and not f.endswith('_mask.png')]
+        image_files = [
+            f for f in files
+            if f.endswith(img_exts)
+            and not f.endswith('_mask.png')
+            and not f.startswith('._')   # skip macOS resource forks
+        ]
         
         for f in image_files:
             base = os.path.splitext(f)[0]
@@ -273,7 +284,21 @@ class PartImageNetDataset(Dataset):
         """
         if self.has_annotations:
             ann = self.annotations[idx]
-            image = Image.open(ann['image_path']).convert('RGB')
+            img_path = ann['image_path']
+            # Safety check: skip macOS resource fork files
+            if '__MACOSX' in img_path or os.path.basename(img_path).startswith('._'):
+                # Return a blank placeholder so training doesn't crash
+                logger.warning(f'Skipping invalid macOS resource fork: {img_path}')
+                image = Image.new('RGB', (224, 224))
+                part_labels = ann['parts']
+                metadata = {
+                    'category_id': ann['category_id'],
+                    'supercategory': ann['supercategory'],
+                }
+                if self.transform is not None:
+                    image = self.transform(image)
+                return image, part_labels, metadata
+            image = Image.open(img_path).convert('RGB')
             part_labels = ann['parts']
             metadata = {
                 'category_id': ann['category_id'],
