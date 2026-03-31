@@ -133,68 +133,110 @@ class PartImageNetDataset(Dataset):
     ):
         super().__init__()
         self.root_path = root_path
-        self.image_folder = os.path.join(root_path, image_folder)
         self.transform = transform
         self.train = train
         self.max_parts = max_parts
 
-        # Determine if annotation_file is a file or a directory
+        # 1. Resolve image folder path (magic discovery)
+        target_split = os.path.basename(image_folder.rstrip('/\\'))
+        if not os.path.isabs(image_folder):
+            candidate_paths = [
+                os.path.join(root_path, image_folder),
+                os.path.join(root_path, 'images', image_folder),
+                os.path.join(root_path, 'images', target_split),
+                os.path.join(root_path, 'train') if 'train' in image_folder else os.path.join(root_path, 'val'),
+            ]
+            for p in candidate_paths:
+                if os.path.exists(p):
+                    image_folder = p
+                    break
+        self.image_folder = image_folder
+
+        # 2. Resolve annotation path/folder
+        if annotation_file is None:
+            if 'images' in self.image_folder:
+                candidate_ann = self.image_folder.replace('images', 'annotations')
+                if os.path.exists(candidate_ann):
+                    annotation_file = candidate_ann
+            else:
+                candidate_ann = os.path.join(root_path, 'annotations', target_split)
+                if os.path.exists(candidate_ann):
+                    annotation_file = candidate_ann
+
+        logger.info(f'Resolved image_folder: {self.image_folder}')
+        logger.info(f'Resolved annotation_source: {annotation_file}')
+
+        # 3. Load annotations based on type
         if annotation_file is not None and os.path.isdir(annotation_file):
-            logger.info(f'Walking directory for annotations: {annotation_file}')
-            self.annotations = self._crawl_annotations(annotation_file)
+            logger.info(f'Crawling directory for annotations: {annotation_file}')
+            self.annotations = self._crawl_annotations(self.image_folder, annotation_file)
             self.has_annotations = True
         elif annotation_file is not None and os.path.isfile(annotation_file):
             self.annotations = self._load_annotations(annotation_file)
             self.has_annotations = True
         else:
-            # Check if image_folder itself contains JSONs (user structure)
-            json_files = [f for f in os.listdir(self.image_folder) if f.endswith('.json')]
-            if len(json_files) > 10: # Threshold to assume mixed directory
-                logger.info(f'Mixed directory detected. Crawling {self.image_folder}')
-                self.annotations = self._crawl_annotations(self.image_folder)
-                self.has_annotations = True
+            # Fallback for mixed folders or no annotations
+            if os.path.exists(self.image_folder):
+                json_files = [f for f in os.listdir(self.image_folder) if f.endswith('.json') and not f.startswith('._')]
+                if len(json_files) > 10:
+                    logger.info(f'Mixed directory detected. Crawling {self.image_folder}')
+                    self.annotations = self._crawl_annotations(self.image_folder, self.image_folder)
+                    self.has_annotations = True
+                else:
+                    self.annotations = None
+                    self.has_annotations = False
+                    self._init_imagefolder()
             else:
-                # Fall back to ImageFolder-style loading without part annotations
-                self.annotations = None
+                logger.error(f'Image folder does not exist: {self.image_folder}')
+                self.annotations = []
                 self.has_annotations = False
-                self._init_imagefolder()
 
-    def _crawl_annotations(self, folder):
-        """Build annotation list by scanning individual JSON/PNG pairs."""
+    def _crawl_annotations(self, image_folder, annotation_folder):
+        """Build annotation list by correctly matching images and annotations."""
         annotations = []
-
-        # Skip __MACOSX directories entirely
-        if '__MACOSX' in folder:
-            logger.info(f'Skipping __MACOSX directory: {folder}')
-            return annotations
-
-        files = os.listdir(folder)
-        # Find all images (assuming .png or .JPEG as reported)
-        img_exts = ('.png', '.JPEG', '.jpg', '.jpeg', '.JPG', '.PNG')
-        image_files = [
-            f for f in files
-            if f.endswith(img_exts)
-            and not f.endswith('_mask.png')
-            and not f.startswith('._')   # skip macOS resource forks
-        ]
         
-        for f in image_files:
-            base = os.path.splitext(f)[0]
-            json_path = os.path.join(folder, base + '.json')
-            mask_path = os.path.join(folder, base + '.png') # reported png mask
+        # Collect all image files recursively
+        image_files = []
+        img_exts = ('.JPEG', '.jpg', '.jpeg', '.JPG', '.png', '.PNG')
+        if os.path.exists(image_folder):
+            for root, _, files in os.walk(image_folder):
+                if '__MACOSX' in root: continue
+                if 'annotations' in root.lower(): continue
+                
+                for f in files:
+                    if f.lower().endswith(img_exts) and not f.startswith('._'):
+                        # Skip files that look like masks or json (if mixed)
+                        if not f.endswith('_mask.png') and '_mask' not in f and not f.endswith('.json'):
+                            image_files.append(os.path.join(root, f))
+        
+        if not image_files:
+            logger.error(f'No image files found in {image_folder}')
+            return []
+
+        # Optimization: Pre-scan annotation folder to avoid slow exists() calls
+        ann_map = {}
+        if os.path.exists(annotation_folder):
+            for root, _, files in os.walk(annotation_folder):
+                if '__MACOSX' in root: continue
+                for f in files:
+                    if f.endswith('.json') and not f.startswith('._'):
+                        stem = os.path.splitext(f)[0]
+                        ann_map[stem] = os.path.join(root, f)
+
+        logger.info(f'Identified {len(image_files)} images and {len(ann_map)} metadata files')
+
+        for img_path in image_files:
+            base_name = os.path.basename(img_path)
+            base_stem = os.path.splitext(base_name)[0]
             
-            if not os.path.exists(json_path):
-                # Check root annotations folder if collocated fails
-                root_ann = os.path.join(self.root_path, 'annotations', 'train')
-                json_path = os.path.join(root_ann, base + '.json')
-            
-            # Extract synset from filename (e.g. n01440764_10029 -> n01440764)
-            synset = f.split('_')[0]
+            # Find matching JSON in our pre-scanned map
+            json_path = ann_map.get(base_stem)
+
+            # Heuristic synset extraction
+            synset = base_stem.split('_')[0]
             super_cat = SYNSET_TO_SUPERCATEGORY.get(synset, 'Unknown')
             
-            # Fallback based on knowledge of PartImageNet ranges if synset unknown
             if super_cat == 'Unknown':
-                # Heuristic: Bird synsets usually start with n015-n020
                 if synset.startswith('n015') or synset.startswith('n016'): super_cat = 'Bird'
                 elif synset.startswith('n014'): super_cat = 'Fish'
                 elif synset.startswith('n020') or synset.startswith('n021'): super_cat = 'Quadruped'
@@ -202,14 +244,14 @@ class PartImageNetDataset(Dataset):
             parts = PARTIMAGENET_PARTS.get(super_cat, ['body'])
             
             annotations.append({
-                'image_path': os.path.join(folder, f),
+                'image_path': img_path,
                 'json_path': json_path,
                 'parts': list(parts[:self.max_parts]),
-                'category_id': synset, # use synset as ID
+                'category_id': synset,
                 'supercategory': super_cat,
             })
             
-        logger.info(f'Crawled {len(annotations)} items from {folder}')
+        logger.info(f'Successfully prepared {len(annotations)} items')
         return annotations
 
     def _load_annotations(self, annotation_file):
@@ -218,10 +260,10 @@ class PartImageNetDataset(Dataset):
         with open(annotation_file, 'r') as f:
             data = json.load(f)
 
-        # Build image_id → image info mapping
+        # Build image_id -> image info mapping
         images = {img['id']: img for img in data['images']}
 
-        # Build category_id → supercategory mapping
+        # Build category_id -> supercategory mapping
         cat_to_super = {}
         for cat in data.get('categories', []):
             cat_to_super[cat['id']] = cat.get('supercategory', 'Unknown')
@@ -233,6 +275,24 @@ class PartImageNetDataset(Dataset):
             if img_info is None:
                 continue
 
+            # Resolve image path
+            img_name = img_info.get('file_name', img_info.get('filename', ''))
+            if not img_name:
+                continue
+            
+            # Try to find the image in image_folder
+            img_path = os.path.join(self.image_folder, img_name)
+            if not os.path.exists(img_path):
+                # Try recursive search if flat match fails
+                found = False
+                for root, _, files in os.walk(self.image_folder):
+                    if img_name in files:
+                        img_path = os.path.join(root, img_name)
+                        found = True
+                        break
+                if not found:
+                    continue
+
             # Get part names from annotation
             parts = []
             if 'parts' in ann:
@@ -242,8 +302,12 @@ class PartImageNetDataset(Dataset):
                         parts.append(part_name.lower().strip())
 
             # If no explicit parts, infer from supercategory
+            synset = img_name.split('_')[0]
+            super_cat = cat_to_super.get(ann.get('category_id'), 'Unknown')
+            if super_cat == 'Unknown':
+                super_cat = SYNSET_TO_SUPERCATEGORY.get(synset, 'Unknown')
+            
             if not parts:
-                super_cat = cat_to_super.get(ann.get('category_id'), 'Unknown')
                 parts = PARTIMAGENET_PARTS.get(super_cat, ['body'])
 
             # Deduplicate while preserving order
@@ -255,8 +319,10 @@ class PartImageNetDataset(Dataset):
                     unique_parts.append(p)
 
             annotations.append({
-                'supercategory': cat_to_super.get(
-                    ann.get('category_id'), 'Unknown'),
+                'image_path': img_path,
+                'parts': list(unique_parts[:self.max_parts]),
+                'category_id': synset,
+                'supercategory': super_cat,
             })
 
         logger.info(f'Loaded {len(annotations)} PartImageNet annotations')
@@ -278,27 +344,25 @@ class PartImageNetDataset(Dataset):
     def __getitem__(self, idx):
         """
         Returns:
-            image: transformed image tensor
-            part_labels: list of part-label strings
-            metadata: dict with category info
+        image: transformed image tensor
+        part_labels: list of part-label strings
+        metadata: dict with category info
         """
         if self.has_annotations:
             ann = self.annotations[idx]
             img_path = ann['image_path']
-            # Safety check: skip macOS resource fork files
-            if '__MACOSX' in img_path or os.path.basename(img_path).startswith('._'):
-                # Return a blank placeholder so training doesn't crash
-                logger.warning(f'Skipping invalid macOS resource fork: {img_path}')
-                image = Image.new('RGB', (224, 224))
-                part_labels = ann['parts']
-                metadata = {
-                    'category_id': ann['category_id'],
-                    'supercategory': ann['supercategory'],
-                }
-                if self.transform is not None:
-                    image = self.transform(image)
-                return image, part_labels, metadata
-            image = Image.open(img_path).convert('RGB')
+            
+            # Robust loading with fallback
+            try:
+                # Extra check for macOS resource fork files
+                if os.path.basename(img_path).startswith('._') or '__MACOSX' in img_path:
+                    raise IOError("Invalid macOS resource fork")
+                    
+                image = Image.open(img_path).convert('RGB')
+            except Exception as e:
+                logger.warning(f'Failed to load image {img_path}: {e}. Returning placeholder.')
+                image = Image.new('RGB', (224, 224), (128, 128, 128))
+            
             part_labels = ann['parts']
             metadata = {
                 'category_id': ann['category_id'],
