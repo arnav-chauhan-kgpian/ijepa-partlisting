@@ -116,21 +116,51 @@ class PartImageNetDataset(Dataset):
         self.default_parts = PARTIMAGENET_PARTS.get('Bird', [])
 
         # 1. Resolve image folder path (magic discovery)
+        # Handle cases where user/downloader points to __MACOSX junk
+        if '__MACOSX' in root_path:
+            alt_root = root_path.replace('__MACOSX', '').replace('//', '/').replace('\\\\', '\\')
+            if os.path.exists(alt_root):
+                logger.info(f'Escaping __MACOSX: {root_path} -> {alt_root}')
+                root_path = alt_root
+        
+        self.root_path = root_path
         target_split = os.path.basename(image_folder.rstrip('/\\'))
+        
         if not os.path.isabs(image_folder):
+            # Check various relative paths
             candidate_paths = [
                 os.path.join(root_path, image_folder),
                 os.path.join(root_path, 'images', image_folder),
                 os.path.join(root_path, 'images', target_split),
-                os.path.join(root_path, 'train') if 'train' in image_folder else os.path.join(root_path, 'val'),
+                os.path.join(root_path, 'train' if 'train' in image_folder else 'val'),
             ]
+            
+            # If root_path itself is an 'annotations' folder, try sibling or parent
+            if 'annotations' in root_path.lower():
+                parent = os.path.dirname(root_path.rstrip('/\\'))
+                candidate_paths.append(os.path.join(parent, 'images', target_split))
+                candidate_paths.append(os.path.join(parent, target_split))
+
             for p in candidate_paths:
-                if os.path.exists(p):
+                if os.path.exists(p) and not '__MACOSX' in p:
                     image_folder = p
                     break
+        
+        # Final cleanup for image_folder: if it still points to junk, try to escape
+        if '__MACOSX' in image_folder:
+            alt_img = image_folder.replace('__MACOSX', '').replace('//', '/').replace('\\\\', '\\')
+            if os.path.exists(alt_img):
+                image_folder = alt_img
+
         self.image_folder = image_folder
 
         # 2. Resolve annotation path/folder
+        if annotation_file is not None and '__MACOSX' in annotation_file:
+            alt_ann = annotation_file.replace('__MACOSX', '').replace('//', '/').replace('\\\\', '\\')
+            if os.path.exists(alt_ann):
+                logger.info(f'Escaping __MACOSX in annotation path: {annotation_file} -> {alt_ann}')
+                annotation_file = alt_ann
+
         if annotation_file is None:
             if 'images' in self.image_folder:
                 candidate_ann = self.image_folder.replace('images', 'annotations')
@@ -178,8 +208,11 @@ class PartImageNetDataset(Dataset):
         img_exts = ('.JPEG', '.jpg', '.jpeg', '.JPG', '.png', '.PNG')
         if os.path.exists(image_folder):
             for root, _, files in os.walk(image_folder):
-                if '__MACOSX' in root: continue
-                if 'annotations' in root.lower(): continue
+                # Only skip if we are SURE it's the junk fork, but if the user
+                # explicitly pointed us here and it's all there is, we might have to allow it.
+                # Usually we want to skip it.
+                if '__MACOSX' in root and '/images' not in root: continue
+                if 'annotations' in root.lower() and '/images' not in root.lower(): continue
                 
                 for f in files:
                     if f.lower().endswith(img_exts) and not f.startswith('._'):
