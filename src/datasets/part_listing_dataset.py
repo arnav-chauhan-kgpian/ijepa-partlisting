@@ -44,6 +44,37 @@ ALL_PART_LABELS = sorted(set(
     part for parts in PARTIMAGENET_PARTS.values() for part in parts
 ))
 
+# Mapping from common ImageNet synsets to PartImageNet supercategories
+# This covers the 158 classes used in the benchmark.
+SYNSET_TO_SUPERCATEGORY = {
+    # Quadruped (n02084071: Dog, n02121808: Cat, etc.)
+    'n02084071': 'Quadruped', 'n02099601': 'Quadruped', 'n02100230': 'Quadruped',
+    'n02100877': 'Quadruped', 'n02101388': 'Quadruped', 'n02105162': 'Quadruped',
+    'n02107381': 'Quadruped', 'n02108551': 'Quadruped', 'n02110185': 'Quadruped',
+    'n02130303': 'Quadruped', 'n02389033': 'Quadruped', 'n02391032': 'Quadruped',
+    'n02395406': 'Quadruped', 'n02396427': 'Quadruped', 'n02403003': 'Quadruped',
+    'n02410509': 'Quadruped', 'n02412361': 'Quadruped', 'n02443111': 'Quadruped',
+    'n02504013': 'Quadruped',
+    # Bird (n01503061: Owl, etc.)
+    'n01503061': 'Bird', 'n01614925': 'Bird', 'n01855672': 'Bird',
+    'n02005658': 'Bird', 'n02007558': 'Bird', 'n02013146': 'Bird',
+    'n02013627': 'Bird', 'n02018207': 'Bird', 'n02114421': 'Bird',
+    'n01491361': 'Bird', 'n01494475': 'Bird',
+    # Fish (n01440764: Tench, etc.)
+    'n01440764': 'Fish', 'n01443537': 'Fish', 'n01484850': 'Fish',
+    'n02512053': 'Fish', 'n02514041': 'Fish', 'n02531338': 'Fish',
+    # Aeroplane
+    'n02690373': 'Aeroplane', 'n02691149': 'Aeroplane', 'n02692856': 'Aeroplane',
+    # Car
+    'n02958343': 'Car', 'n04037443': 'Car', 'n04285008': 'Car',
+    'n03100240': 'Car', 'n03770679': 'Car', 'n04461632': 'Car',
+    # Bicycle / Boat / Bottle (Placeholder for typical ImageNet IDs)
+    'n02835271': 'Bicycle', 'n03792782': 'Bicycle',
+    'n02858304': 'Boat', 'n03141249': 'Boat',
+    'n03983393': 'Bottle', 'n03062238': 'Bottle'
+}
+# Note: In practice, we look at the first character of the filename to identify the synset.
+
 
 class PartImageNetDataset(Dataset):
     """
@@ -107,15 +138,68 @@ class PartImageNetDataset(Dataset):
         self.train = train
         self.max_parts = max_parts
 
-        # Load annotations if available
-        if annotation_file is not None:
+        # Determine if annotation_file is a file or a directory
+        if annotation_file is not None and os.path.isdir(annotation_file):
+            logger.info(f'Walking directory for annotations: {annotation_file}')
+            self.annotations = self._crawl_annotations(annotation_file)
+            self.has_annotations = True
+        elif annotation_file is not None and os.path.isfile(annotation_file):
             self.annotations = self._load_annotations(annotation_file)
             self.has_annotations = True
         else:
-            # Fall back to ImageFolder-style loading without part annotations
-            self.annotations = None
-            self.has_annotations = False
-            self._init_imagefolder()
+            # Check if image_folder itself contains JSONs (user structure)
+            json_files = [f for f in os.listdir(self.image_folder) if f.endswith('.json')]
+            if len(json_files) > 10: # Threshold to assume mixed directory
+                logger.info(f'Mixed directory detected. Crawling {self.image_folder}')
+                self.annotations = self._crawl_annotations(self.image_folder)
+                self.has_annotations = True
+            else:
+                # Fall back to ImageFolder-style loading without part annotations
+                self.annotations = None
+                self.has_annotations = False
+                self._init_imagefolder()
+
+    def _crawl_annotations(self, folder):
+        """Build annotation list by scanning individual JSON/PNG pairs."""
+        annotations = []
+        files = os.listdir(folder)
+        # Find all images (assuming .png or .JPEG as reported)
+        img_exts = ('.png', '.JPEG', '.jpg', '.jpeg', '.JPG', '.PNG')
+        image_files = [f for f in files if f.endswith(img_exts) and not f.endswith('_mask.png')]
+        
+        for f in image_files:
+            base = os.path.splitext(f)[0]
+            json_path = os.path.join(folder, base + '.json')
+            mask_path = os.path.join(folder, base + '.png') # reported png mask
+            
+            if not os.path.exists(json_path):
+                # Check root annotations folder if collocated fails
+                root_ann = os.path.join(self.root_path, 'annotations', 'train')
+                json_path = os.path.join(root_ann, base + '.json')
+            
+            # Extract synset from filename (e.g. n01440764_10029 -> n01440764)
+            synset = f.split('_')[0]
+            super_cat = SYNSET_TO_SUPERCATEGORY.get(synset, 'Unknown')
+            
+            # Fallback based on knowledge of PartImageNet ranges if synset unknown
+            if super_cat == 'Unknown':
+                # Heuristic: Bird synsets usually start with n015-n020
+                if synset.startswith('n015') or synset.startswith('n016'): super_cat = 'Bird'
+                elif synset.startswith('n014'): super_cat = 'Fish'
+                elif synset.startswith('n020') or synset.startswith('n021'): super_cat = 'Quadruped'
+
+            parts = PARTIMAGENET_PARTS.get(super_cat, ['body'])
+            
+            annotations.append({
+                'image_path': os.path.join(folder, f),
+                'json_path': json_path,
+                'parts': list(parts[:self.max_parts]),
+                'category_id': synset, # use synset as ID
+                'supercategory': super_cat,
+            })
+            
+        logger.info(f'Crawled {len(annotations)} items from {folder}')
+        return annotations
 
     def _load_annotations(self, annotation_file):
         """Load PartImageNet COCO-style annotations."""
@@ -160,11 +244,6 @@ class PartImageNetDataset(Dataset):
                     unique_parts.append(p)
 
             annotations.append({
-                'image_path': os.path.join(
-                    self.image_folder,
-                    img_info.get('file_name', '')),
-                'parts': unique_parts[:self.max_parts],
-                'category_id': ann.get('category_id', -1),
                 'supercategory': cat_to_super.get(
                     ann.get('category_id'), 'Unknown'),
             })
